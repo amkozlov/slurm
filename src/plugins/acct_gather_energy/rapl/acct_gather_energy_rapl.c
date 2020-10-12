@@ -82,6 +82,19 @@
 #define MSR_DRAM_PERF_STATUS            0x61B
 #define MSR_DRAM_POWER_INFO             0x61C
 
+/* Intel CPU models from here: https://en.wikichip.org/wiki/intel/cpuid */
+#define CPU_HASWELL_EP		63
+#define CPU_BROADWELL_EP	79
+#define CPU_BROADWELL_DE	86
+#define CPU_SKYLAKE_X		85
+#define CPU_ICELAKE_DE		106
+#define CPU_ICELAKE_SP		108
+#define CPU_KNIGHTS_LANDING	87
+#define CPU_KNIGHTS_MILL	133
+
+#define CPU_VENDOR_INTEL	1
+#define CPU_VENDOR_AMD		2
+
 union {
 	uint64_t val;
 	struct {
@@ -132,6 +145,8 @@ static int pkg_fd[MAX_PKGS] = {[0 ... MAX_PKGS-1] = -1};
 static char hostname[MAXHOSTNAMELEN];
 
 static int nb_pkg = 0;
+
+static int different_energy_units = 0;
 
 static stepd_step_rec_t *job = NULL;
 
@@ -240,6 +255,7 @@ static void _hardware(void)
 	char buf[1024];
 	FILE *fd;
 	int cpu = -1, pkg = -1;
+	int vendor = -1, family = -1, model = -1;
 
 	if ((fd = fopen("/proc/cpuinfo", "r")) == 0)
 		fatal("RAPL: error on attempt to open /proc/cpuinfo");
@@ -267,8 +283,44 @@ static void _hardware(void)
 			}
 			continue;
 		}
+                if (!xstrncmp(buf, "vendor_id", sizeof("vendor_id") - 1)) {
+			char vendor_str[13];
+			sscanf(buf, "vendor_id\t: %12s", vendor_str);
+			if (!strncmp(vendor_str, "GenuineIntel", 12)) 
+				vendor = CPU_VENDOR_INTEL;
+			else if (!strncmp(vendor_str, "AuthenticAMD", 12))
+				vendor = CPU_VENDOR_AMD;
+			continue;
+		}
+		if (!xstrncmp(buf, "cpu family", sizeof("cpu family") - 1)) {
+			sscanf(buf, "cpu family\t: %d", &family);
+			continue;
+                }
+		if (!xstrncmp(buf, "model", sizeof("model") - 1)) {
+			sscanf(buf, "model\t: %d", &model);
+			continue;
+                }
 	}
 	fclose(fd);
+
+	/* On Intel server CPUs starting with Haswell, DRAM energy unit differs 
+	*  from the CPU energy unit. */
+	if (vendor == CPU_VENDOR_INTEL && family == 6) {
+		switch(model) {
+			case CPU_HASWELL_EP:
+			case CPU_BROADWELL_EP:
+			case CPU_BROADWELL_DE:
+			case CPU_SKYLAKE_X:
+			case CPU_ICELAKE_DE:
+			case CPU_ICELAKE_SP:
+			case CPU_KNIGHTS_LANDING:
+			case CPU_KNIGHTS_MILL:
+				different_energy_units = 1;
+				break;
+			default:
+				different_energy_units = 0;
+		}
+	}
 
 	log_flag(ENERGY, "RAPL Found: %d packages", nb_pkg);
 }
@@ -302,81 +354,102 @@ _send_drain_request(void)
 static void _get_joules_task(acct_gather_energy_t *energy)
 {
 	int i;
-	double energy_units;
-	uint64_t result;
-	double ret;
+	uint64_t raw_energy = 0;
+	double joules = 0.;
 	static uint32_t readings = 0;
+	static double ave_watts = 0;
 
-	if (pkg_fd[0] < 0) {
-		error("%s: device /dev/cpu/#/msr not opened "
-		      "energy data cannot be collected.", __func__);
-		_send_drain_request();
-		return;
-	}
+	for (i = 0; i < nb_pkg; i++) {
+		double energy_units;
+		double dram_energy_units;
+		uint64_t result;
+		uint64_t pkg_energy;
+		uint64_t dram_energy;
 
-	/*
-	 * MSR_RAPL_POWER_UNIT
-	 * Power Units - bits 3:0
-	 * Energy Status Units - bits 12:8
-	 * Time Units - bits 19:16
-	 * See: Intel 64 and IA-32 Architectures Software Developer's
-	 * Manual, Volume 3 for details
-	 */
-	result = _read_msr(pkg_fd[0], MSR_RAPL_POWER_UNIT);
-	energy_units = pow(0.5, (double)((result>>8)&0x1f));
+		if (pkg_fd[i] < 0) {
+			error("%s: device /dev/cpu/#/msr not opened "
+			      "energy data cannot be collected.", __func__);
+			_send_drain_request();
+			return;
+		}
 
-	if (slurm_conf.debug_flags & DEBUG_FLAG_ENERGY) {
-		double power_units = pow(0.5, (double)(result&0xf));
-		unsigned long max_power;
-
-		info("RAPL powercapture_debug Energy units = %.6f, "
-		     "Power Units = %.6f", energy_units, power_units);
 		/*
-		 * MSR_PKG_POWER_INFO
-		 * Thermal Spec Power - bits 14:0
-		 * Minimum Power - bits 30:16
-		 * Maximum Power - bits 46:32
-		 * Maximum Time Window - bits 53:48
+		 * MSR_RAPL_POWER_UNIT
+		 * Power Units - bits 3:0
+		 * Energy Status Units - bits 12:8
+		 * Time Units - bits 19:16
 		 * See: Intel 64 and IA-32 Architectures Software Developer's
 		 * Manual, Volume 3 for details
 		 */
-		result = _read_msr(pkg_fd[0], MSR_PKG_POWER_INFO);
-		max_power = power_units * ((result >> 32) & 0x7fff);
-		info("RAPL Max power = %ld w", max_power);
+		result = _read_msr(pkg_fd[i], MSR_RAPL_POWER_UNIT);
+		energy_units = pow(0.5, (double)((result>>8)&0x1f));
+
+		/*
+		 * DRAM and PKG energy units are different on many systems
+		 * See: https://bugs.schedmd.com/show_bug.cgi?id=9956
+		 *      https://github.com/deater/uarch-configure/blob/master/rapl-read/rapl-read.c#L455
+		 */
+		dram_energy_units = different_energy_units ? 
+					pow(0.5,(double)16) : energy_units;
+
+		if (slurm_conf.debug_flags & DEBUG_FLAG_ENERGY) {
+			double power_units = pow(0.5, (double)(result&0xf));
+			unsigned long max_power;
+
+			info("RAPL pkg %i: powercapture_debug Energy units = %.6f, "
+			     "DRAM Energy units = %.6f, Power Units = %.6f", 
+                	      i, energy_units, dram_energy_units, power_units);
+
+			/*
+			 * MSR_PKG_POWER_INFO
+			 * Thermal Spec Power - bits 14:0
+			 * Minimum Power - bits 30:16
+			 * Maximum Power - bits 46:32
+			 * Maximum Time Window - bits 53:48
+			 * See: Intel 64 and IA-32 Architectures Software Developer's
+			 * Manual, Volume 3 for details
+			 */
+			result = _read_msr(pkg_fd[i], MSR_PKG_POWER_INFO);
+			max_power = power_units * ((result >> 32) & 0x7fff);
+			info("RAPL pkg %d: Max power = %ld w", i, max_power);
+		}
+
+		pkg_energy = _get_package_energy(i);
+		dram_energy = _get_dram_energy(i);
+		raw_energy += pkg_energy + dram_energy;
+		joules += (double)pkg_energy * energy_units;
+		joules += (double)dram_energy * dram_energy_units;
 	}
 
-	result = 0;
-	for (i = 0; i < nb_pkg; i++)
-		result += _get_package_energy(i) + _get_dram_energy(i);
-
-	ret = (double)result * energy_units;
-
-	log_flag(ENERGY, "RAPL Result %"PRIu64" = %.6f Joules", result, ret);
+	log_flag(ENERGY, "RAPL Result %"PRIu64" = %.6f Joules", raw_energy, joules);
 
 	if (energy->consumed_energy) {
 		time_t interval;
 
 		energy->consumed_energy =
-			(uint64_t)ret - energy->base_consumed_energy;
+			(uint64_t)joules - energy->base_consumed_energy;
 		energy->current_watts =
-			(uint32_t)ret - energy->previous_consumed_energy;
-		energy->ave_watts =  ((energy->ave_watts * readings) +
-				       energy->current_watts) / (readings + 1);
+			(uint32_t)joules - energy->previous_consumed_energy;
 
 		interval = time(NULL) - energy->poll_time;
 		if (interval)	/* Prevent divide by zero */
 			energy->current_watts /= (float)interval;
+
+		ave_watts = ((ave_watts * readings) +
+                		energy->current_watts) / (readings + 1);
+
+		energy->ave_watts = (uint64_t)ave_watts;
 	} else {
 		energy->consumed_energy = 1;
-		energy->base_consumed_energy = (uint64_t)ret;
+		energy->base_consumed_energy = (uint64_t)joules;
 		energy->ave_watts = 0;
 	}
 	readings++;
-	energy->previous_consumed_energy = (uint64_t)ret;
+	energy->previous_consumed_energy = (uint64_t)joules;
 	energy->poll_time = time(NULL);
 
 	log_flag(ENERGY, "%s: current %.6f Joules, consumed %"PRIu64"",
-		 __func__, ret, energy->consumed_energy);
+		 __func__, joules, energy->consumed_energy);
 }
 
 static int _running_profile(void)
